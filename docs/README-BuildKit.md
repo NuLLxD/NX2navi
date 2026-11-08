@@ -58,6 +58,49 @@ run the same command again: finished steps are skipped.
 When it says `finished`, start `C:\Games\Ocarina\ocarina.exe`. You can delete `C:\Games\Ocarina\build-cache` (about
 5 GB) afterwards.
 
+## Native Linux x86-64 (experimental)
+
+The build kit can now use the existing Linux SDL3/Vulkan runtime to build an ELF executable named `ocarina` from
+the same Ocarina of Time 1.1.1 `.nup` or extracted `exefs`/`romfs` inputs. This is an **experimental build path**;
+it has not yet been verified in gameplay. The Windows launcher and installer are not ported.
+
+On Arch Linux, install the toolchain listed under Linux in [building.md](building.md). `clang++` and a static
+`libstdc++.a` must also be available. The Vulkan Memory Allocator header is taken from the system when installed,
+otherwise the pinned version is fetched into `toolchain/vma`.
+
+Use fish from the repository root:
+
+```fish
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python numpy lz4 zstandard zbic
+.venv/bin/python tools/build_xlate.py
+
+# Use your own verified extracted dump:
+set EXEFS "/absolute/path/to/exefs"
+set ROMFS "/absolute/path/to/romfs"
+.venv/bin/python -I tools/make_game.py --exefs "$EXEFS" --romfs "$ROMFS" --check
+
+# Compile and link; omit the graphical shader-preparation step on the first build:
+.venv/bin/python -I tools/make_game.py --exefs "$EXEFS" --romfs "$ROMFS" \
+    --out build/ocarina-linux --until compile --jobs 4
+
+file build/ocarina-linux/ocarina
+build/ocarina-linux/ocarina --selftest
+```
+
+Alternatively, give `--nup "/absolute/path/to/game.nup"` in place of the two folder flags.
+The build's `--jobs` controls parallel compilation; adjust it to your available RAM. To select a separate LLVM
+installation, pass `--toolchain /path/to/llvm` with `bin/clang`, `bin/clang++` and `bin/ld.lld`.
+
+The `--until compile` command produces the ELF before any attempt to launch the game's Vulkan shader-preparation
+pass. After the ELF is verified, repeat the same command **without** `--until compile` from a graphical desktop
+session to attempt shader preparation, then run `build/ocarina-linux/ocarina`.
+The `build/ocarina-linux` folder contains files derived from your game; do not commit it, attach it to a PR, or
+publish the resulting executable. Report only compiler output, test results, and runtime logs (without secrets).
+
+This path is not an AppImage. Its ELF is linked against Linux system Vulkan, SDL3, Opus, libvpx, zstd and the
+host C/C++ runtime. Package it only after gameplay testing succeeds.
+
 ## Playing
 
 - **F1** opens the settings menu. Settings are saved in `nx2navi.ini` beside the game; saves go to `profile\`.

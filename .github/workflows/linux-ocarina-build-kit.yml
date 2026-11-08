@@ -38,7 +38,7 @@ jobs:
       - name: Install native Arch dependencies
         run: |
           pacman -Syu --noconfirm --needed ca-certificates git python clang lld llvm gcc make ninja \
-            sdl3 opus libvpx zstd vulkan-headers vulkan-icd-loader shaderc spirv-tools
+            sdl3 opus libvpx dav1d zstd vulkan-headers vulkan-icd-loader shaderc spirv-tools
       - uses: actions/checkout@v4
       - name: Compile the native runtime as an archive without game files
         run: python tools/make_game.py --make-runtime-lib build/runtime-lib-linux --jobs 4

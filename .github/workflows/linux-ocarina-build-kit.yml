@@ -1,0 +1,31 @@
+name: Linux Ocarina build-kit checks
+
+on:
+  push:
+    branches: [port/linux-oot-111]
+  pull_request:
+    paths:
+      - tools/make_game.py
+      - tools/build_game.py
+      - tests/linux_make_game_test.py
+      - .github/workflows/linux-ocarina-build-kit.yml
+
+permissions:
+  contents: read
+
+jobs:
+  no-game-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check syntax
+        run: python -m py_compile tools/make_game.py tools/build_game.py tests/linux_make_game_test.py
+      - name: Check native build configuration
+        run: python -m unittest discover -s tests -p linux_make_game_test.py -v
+      - name: Check CLI
+        run: python tools/make_game.py --help
+      - name: Refuse game-derived or private files
+        run: python tools/check_content.py

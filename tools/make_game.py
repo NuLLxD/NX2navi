@@ -1,4 +1,4 @@
-"""Build Ocarina of Time (Switch 2, game 1.1.1) for Windows on the player's PC, from the player's own game files.
+"""Build Ocarina of Time (Switch 2, game 1.1.1) on the player's PC, from the player's own game files.
 
     python -I tools/make_game.py --nup "C:\\path\\game.nup" --out "C:\\Games\\Ocarina"
     python -I tools/make_game.py --exefs "C:\\path\\exefs" --romfs "C:\\path\\romfs" --out "C:\\Games\\Ocarina"
@@ -13,8 +13,8 @@ Steps, each skipped when a run before finished it for the same inputs (state in 
               index.json (16-byte aligned, in the byte order of the paths). When the lift and the compile follow, it
               runs on a thread of its own beside them: only the RomFS index and romfs.c wait for the image
   4. lift     recomp/gen.py with recomp/patches-v111.txt -> <out>/build-cache/lift, plus the two SDK bring-up fixes
-  5. compile  the lifted C and runtime/ with MSYS2's clang, linked into <out>/ocarina.exe; the MSYS2 DLLs it loads,
-              the shader translator and romfs-index.bin beside it
+  5. compile  the lifted C and platform runtime/ with Clang, linked into <out>/ocarina.exe (Windows)
+              or <out>/ocarina (Linux); platform dependencies, translator and romfs-index.bin beside it
   6. shaders  every shader in the game files (tools/prepare_shaders.py, default bind state) translated, and each one's
               GPU driver build done once, so play does not stop to compile them (`ocarina.exe --prepare-shaders`)
 
@@ -24,7 +24,7 @@ compile step keeps every object with the dependency list clang wrote for it (bui
 compiles a file again only when it, a header it includes, the flags or the compiler changed; the kit's own folder
 is not part of that key, so a kit in another folder (the launcher keeps each version in its own) reuses the objects.
 A kit with lib/libnx2navirt.a built by --make-runtime-lib for the same runtime/ and the same compiler links the
-runtime from it and compiles only the runtime files that include headers written per install. The new ocarina.exe
+runtime from it and compiles only the runtime files that include headers written per install. The new executable
 replaces the old one only once it links (with lld when the toolchain has it), so a failed build leaves the last good
 one in place. Compiles run on every logical processor, the largest files first. The lifted code is built for this
 PC's x86-64 level (cpu_level), with MSYS2 CLANG64's clang when it sits beside the UCRT64 folder and reports the same
@@ -34,7 +34,7 @@ version (fast_clang: the same objects, about a fifth faster).
 
 Nothing is written outside --out (but for --make-runtime-lib DIR, which writes DIR). The game folder then holds
 only what this PC built from the player's files: never
-share it. Needs Python 3.10+ with numpy, lz4, zstandard and zbic (pip), and MSYS2 UCRT64's clang and libraries
+share it. Needs Python 3.10+ with numpy, lz4, zstandard and zbic (pip), and Clang with the platform's libraries
 (README-BuildKit.md lists the commands). Delete <out>/build-cache afterwards to free about 5 GB; the next build then
 compiles everything again.
 
@@ -58,6 +58,10 @@ import time
 from pathlib import Path
 
 KIT = Path(__file__).resolve().parents[1]
+WIN = os.name == 'nt'
+if not WIN and not sys.platform.startswith('linux'):
+    sys.exit('make_game.py supports Windows and Linux x86-64')
+COMPILER_TAG = ''
 sys.path.insert(0, str(KIT / 'tools'))
 import nup  # noqa: E402
 
@@ -84,10 +88,16 @@ LIFT_FIXES = [
      '    { uint64_t ea = x8 + 0x1f0ull; uint64_t v = LD64(ea); x8 = (uint64_t)(v); }\n'
      '    if (x8) c->tpidr = x8;   /* zero slot: keep the host\'s TLS (make_game.py) */\n'),
 ]
-LINK_LIBS = ['-lvulkan-1', '-lSDL3', '-lopus', '-lvpx', '-l:libdav1d.a', '-lzstd', '-l:libatomic.a', '-lbcrypt',
-             '-limm32', '-luuid', '-lole32', '-luser32', '-lshell32', '-lgdi32', '-ladvapi32', '-lwinmm']
+if WIN:
+    LINK_LIBS = ['-lvulkan-1', '-lSDL3', '-lopus', '-lvpx', '-l:libdav1d.a', '-lzstd', '-l:libatomic.a', '-lbcrypt',
+                 '-limm32', '-luuid', '-lole32', '-luser32', '-lshell32', '-lgdi32', '-ladvapi32', '-lwinmm']
+else:
+    # Share the native link dependencies and VMA header fallback with the established Linux build.
+    from build_game import LINK_LIBS as NATIVE_LINK_LIBS, vma_include  # noqa: E402
+    LINK_LIBS = [*NATIVE_LINK_LIBS, '-ldav1d']   # Ocarina 1.1.1 movie decoder
 SYSTEM_DLLS_SKIP = {'vulkan-1.dll'}   # the graphics driver's loader, never a copy
-EXE_NAME = 'ocarina.exe'
+EXE_NAME = 'ocarina.exe' if WIN else 'ocarina'
+XLATE_NAME = 'nx2navi_xlate.exe' if WIN else 'nx2navi_xlate'
 # Headers this build writes per install (gen.py, romfs_index.py): a runtime source that includes one, directly or
 # through a runtime header, is compiled on the player's PC; every other runtime source can come prebuilt.
 GENERATED_HEADERS = ('layout.h', 'patches.h', 'romfs_config.h')
@@ -432,8 +442,9 @@ def modules_c(lift, out, gen):
           f'const char rt_port_version[] = {json.dumps(kit_version())};']
     p = gen / 'modules.c'
     write_if_changed(p, '\n'.join(L) + '\n')
-    write_if_changed(gen / 'shim.c', '/* Defined by the SDL window path only; this build uses the Win32 one. */\n'
-                                     'void menu_sdl_event(void *e) { (void)e; }\n')
+    if WIN:
+        write_if_changed(gen / 'shim.c', '/* Defined by the SDL window path only; this build uses the Win32 one. */\n'
+                                         'void menu_sdl_event(void *e) { (void)e; }\n')
     return p
 
 
@@ -611,6 +622,37 @@ class ObjectCache:
         tmp.replace(self.path)
 
 
+def compiler_tools(toolchain):
+    """Host Clang/C++ and PATH, optionally preferring --toolchain DIR/bin."""
+    bin_dir = toolchain / 'bin' if toolchain else None
+    env = dict(os.environ)
+    if bin_dir:
+        env['PATH'] = str(bin_dir) + os.pathsep + env.get('PATH', '')
+    suffix = '.exe' if WIN else ''
+
+    def tool(name):
+        path = bin_dir / (name + suffix) if bin_dir else shutil.which(name)
+        if not path or not Path(path).is_file():
+            fail(f'{name}{suffix} missing: install clang or pass --toolchain DIR with bin/{name}{suffix}')
+        return Path(path).resolve()
+
+    return tool('clang'), tool('clang++'), env
+
+
+def vma_headers(toolchain):
+    """Return the platform's Vulkan Memory Allocator include directory."""
+    return toolchain / 'include' / 'vma' if WIN else vma_include()
+
+
+def translator_bundle():
+    """Use the kit's packaged translator, else a locally built Linux translator."""
+    for base in (KIT / 'bin', KIT / 'build' / 'xlate'):
+        exe, ident = base / XLATE_NAME, base / 'nx2navi_xlate.id'
+        if exe.is_file() and ident.is_file():
+            return exe, ident
+    return None
+
+
 def compiler_id(clang, env):
     p = subprocess.run([str(clang), '--version'], capture_output=True, text=True, env=env)
     st = os.stat(clang)
@@ -667,12 +709,14 @@ def compile_all(srcs, cmd_for, cache, jobs, env, progress=None, salt='', stop=No
 
 
 def runtime_sources():
-    """(source, object name) of every runtime file the Windows build compiles."""
+    """Runtime sources for this OS, with the same selection as tools/build_game.py."""
     rt = KIT / 'runtime'
     out = []
     for pat in RUNTIME_PATTERNS:
         for p in sorted(rt.glob(pat)):
-            if p.stem.endswith('_sdl') or p.name == 'linux.c':
+            if WIN and (p.stem.endswith('_sdl') or p.name == 'linux.c'):
+                continue
+            if not WIN and (p.stem.endswith('_win') or p.name == 'win32.c'):
                 continue
             out.append((p, 'rt_' + p.relative_to(rt).as_posix().replace('/', '_').rsplit('.', 1)[0] + '.o'))
     return out
@@ -774,12 +818,11 @@ def make_runtime_lib(dest, msys, jobs, obj=None):
     dest.mkdir(parents=True, exist_ok=True)
     obj = Path(obj).resolve() if obj else dest / 'obj'
     obj.mkdir(parents=True, exist_ok=True)
-    clang, clangxx = msys / 'bin' / 'clang.exe', msys / 'bin' / 'clang++.exe'
-    env = dict(os.environ, PATH=str(msys / 'bin') + os.pathsep + os.environ.get('PATH', ''))
+    clang, clangxx, env = compiler_tools(msys)
     rt = KIT / 'runtime'
     tainted = per_install_names()
     srcs = [(p, obj / name) for p, name in runtime_sources() if not per_install(p, tainted)]
-    inc = ['-I', str(rt), '-I', str(rt / 'third_party' / 'imgui'), '-I', str(msys / 'include' / 'vma')]
+    inc = ['-I', str(rt), '-I', str(rt / 'third_party' / 'imgui'), '-I', str(vma_headers(msys))]
     cache = ObjectCache(obj / 'objects.json', {'<kit>': KIT})
     t0 = time.time()
     compiled, reused, bad = compile_all(srcs, runtime_cmd(clang, clangxx, inc), cache, jobs, env,
@@ -793,10 +836,14 @@ def make_runtime_lib(dest, msys, jobs, obj=None):
     lib.unlink(missing_ok=True)
     rsp = dest / 'ar.rsp'
     rsp.write_text('\n'.join('"%s"' % o.as_posix() for _, o in srcs), encoding='utf-8')
-    ar = os.environ.get('NX2NAVI_AR') or str(msys / 'bin' / 'ar.exe')
+    ar = os.environ.get('NX2NAVI_AR') or (str(msys / 'bin' / 'ar.exe') if WIN else
+         shutil.which('llvm-ar', path=env['PATH']) or shutil.which('ar', path=env['PATH']))
+    if not ar:
+        fail('missing llvm-ar or ar: install llvm/binutils or set NX2NAVI_AR')
     if subprocess.run([ar, 'rcs', str(lib), '@' + str(rsp)], env=env).returncode:
         fail('the runtime library could not be archived')
     meta = {'runtime': runtime_digest(), 'compiler': clang_version(clang, env),
+            'platform': sys.platform, 'target': clang_ident(clang, env),
             'objects': sorted(o.name for _, o in srcs)}
     (dest / 'runtime-lib.json').write_text(json.dumps(meta, indent=1), encoding='utf-8')
     rsp.unlink(missing_ok=True)
@@ -811,7 +858,10 @@ def prebuilt_runtime(clang, env):
         m = json.loads(meta.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return None
-    if not lib.is_file() or m.get('runtime') != runtime_digest() or m.get('compiler') != clang_version(clang, env):
+    if (not lib.is_file() or m.get('runtime') != runtime_digest()
+            or m.get('compiler') != clang_version(clang, env)
+            or m.get('platform', 'win32') != sys.platform
+            or m.get('target', clang_ident(clang, env)) != clang_ident(clang, env)):
         say('  the prebuilt runtime does not match this kit or compiler: compiling runtime/')
         return None
     return lib, set(m.get('objects', []))
@@ -873,8 +923,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None):
     gen.mkdir(parents=True, exist_ok=True)
     obj.mkdir(parents=True, exist_ok=True)
     rt = KIT / 'runtime'
-    clang, clangxx = msys / 'bin' / 'clang.exe', msys / 'bin' / 'clang++.exe'
-    env = dict(os.environ, PATH=str(msys / 'bin') + os.pathsep + os.environ.get('PATH', ''))
+    clang, clangxx, env = compiler_tools(msys)
     if not romfs_job:
         romfs_index(out, gen)
     srcs = [(p, obj / f'{mod}_{p.stem}.o') for mod in ('main', 'sdk', 'subsdk0') for p in sorted((lift / mod).glob('*.c'))]
@@ -884,14 +933,17 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None):
         runtime = [(p, o) for p, o in runtime if o.name not in prebuilt[1]]
         say(f'  the runtime comes prebuilt; {len(runtime)} runtime files are compiled here')
     srcs += runtime
-    srcs += [(modules_c(lift, out, gen), obj / 'modules.o'), (gen / 'shim.c', obj / 'shim.o')]
+    generated = [(modules_c(lift, out, gen), obj / 'modules.o')]
+    if WIN:
+        generated.append((gen / 'shim.c', obj / 'shim.o'))
+    srcs += generated
     inc = ['-I', str(rt), '-I', str(lift), '-I', str(gen), '-I', str(rt / 'third_party' / 'imgui'),
-           '-I', str(msys / 'include' / 'vma')]
+           '-I', str(vma_headers(msys))]
     cid = compiler_id(clang, env)
     level = cpu_level(clang, env)
     say(f'  the lifted code is built for x86-64-v{level}, this processor\'s level' if level else
         '  the lifted code is built for generic x86-64: the processor\'s level could not be read')
-    fast = fast_clang(msys, clang, env)
+    fast = fast_clang(msys, clang, env) if WIN else None
     if fast:
         cid += compiler_id(fast, env)
         say(f'  the lifted code compiles with {fast}')
@@ -913,7 +965,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None):
     late = []
     if romfs_job:   # the lifted chunks include only cpu.h and simd.h: only the runtime and generated files are read
         tainted = per_install_names(('romfs_config.h',))
-        late = [(s, o) for s, o in runtime + srcs[-2:] if per_install(s, tainted)]
+        late = [(s, o) for s, o in runtime + generated if per_install(s, tainted)]
         say(f'  {len(late)} files wait for the RomFS index: {", ".join(s.name for s, _ in late)}')
     early = [j for j in srcs if j not in late]
     compiled, reused, bad = compile_all(early, cmd_for, cache, jobs, env, lambda d, t: progress(d, len(srcs)),
@@ -933,14 +985,17 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None):
             print(f'--- {src}\n{err}', file=sys.stderr)
         fail(f'{len(bad)} files did not compile')
 
-    rco = compile_resources(msys, rt, obj, env)
-    objs = [o for _, o in srcs] + [rco]
+    objs = [o for _, o in srcs]
+    if WIN:
+        objs.append(compile_resources(msys, rt, obj, env))
     exe = out / EXE_NAME
     rsp = cache_dir / 'link.rsp'
     rsp.write_text('\n'.join('"%s"' % o.as_posix() for o in objs), encoding='utf-8')
     # lld links several times faster than GNU ld; the stack matches tools/build_game.py's build
     # 16 MiB for the main thread with either linker (GNU ld takes the same flag): the default 2 MiB is too little
-    ld = (['-fuse-ld=lld'] if (msys / 'bin' / 'ld.lld.exe').is_file() else []) + ['-Wl,--stack,16777216']
+    ld = (['-fuse-ld=lld'] if shutil.which('ld.lld', path=env['PATH']) or
+          (WIN and (msys / 'bin' / 'ld.lld.exe').is_file()) else [])
+    ld += ['-Wl,--stack,16777216'] if WIN else ['-no-pie', '-Wl,-z,noexecstack', '-Wl,-rpath,$ORIGIN']
     lib = ['-Wl,--whole-archive', str(prebuilt[0]), '-Wl,--no-whole-archive'] if prebuilt else []
     stamp = [[o.name, o.stat().st_size, o.stat().st_mtime_ns] for o in objs]
     if prebuilt:
@@ -948,12 +1003,13 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None):
     link_key = sha256_bytes(json.dumps([LINK_LIBS, ld, cid] + stamp).encode())
     state_link = cache_dir / 'link.key'
     if exe.is_file() and state_link.is_file() and state_link.read_text(encoding='utf-8') == link_key:
-        say('  ocarina.exe is current, not linked again')
+        say(f'  {EXE_NAME} is current, not linked again')
     else:
         emit('phase', step='compile', phase='link')
         say('  linking')
         tmp = out / (EXE_NAME + '.new')
-        p = subprocess.run([str(clangxx), *ld, '-o', str(tmp), '@' + str(rsp), *lib, '-L', str(msys / 'lib'),
+        libpath = ['-L', str(msys / 'lib')] if WIN else []
+        p = subprocess.run([str(clangxx), *ld, '-o', str(tmp), '@' + str(rsp), *lib, *libpath,
                             *LINK_LIBS], capture_output=True, text=True, env=env, errors='replace')
         if p.returncode:
             print(p.stderr[-4000:], file=sys.stderr)
@@ -966,11 +1022,16 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None):
             fail(f'{exe} is in use: close the game and try again')
         state_link.write_text(link_key, encoding='utf-8')
     copy_if_changed(gen / 'romfs-index.bin', out / 'romfs-index.bin')
-    for name in ('nx2navi_xlate.exe', 'nx2navi_xlate.id'):
-        copy_if_changed(KIT / 'bin' / name, out / name)
-    if (KIT / 'bin' / 'amd_fidelityfx_vk.dll').is_file():   # FSR 3.1 (runtime/vk_ffx.cpp)
+    translator = translator_bundle()
+    if translator:
+        for src in translator:
+            copy_if_changed(src, out / src.name)
+    else:
+        say('  shader translator missing: run python tools/build_xlate.py before shader preparation')
+    if WIN and (KIT / 'bin' / 'amd_fidelityfx_vk.dll').is_file():   # FSR 3.1 (runtime/vk_ffx.cpp)
         copy_if_changed(KIT / 'bin' / 'amd_fidelityfx_vk.dll', out / 'amd_fidelityfx_vk.dll')
-    say(f'  {EXE_NAME} {exe.stat().st_size / 1e6:.0f} MB; beside it: {", ".join(copy_dlls(exe, msys / "bin", out))}')
+    dlls = copy_dlls(exe, msys / 'bin', out) if WIN else []
+    say(f'  {EXE_NAME} {exe.stat().st_size / 1e6:.0f} MB; beside it: {", ".join(dlls)}')
     (out / 'profile').mkdir(exist_ok=True)
 
 
@@ -979,7 +1040,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None):
 def step_shaders(out):
     """Every shader of the game files into the game's shader cache and the driver's own cache, before the first start."""
     cmd = [sys.executable, str(KIT / 'tools' / 'prepare_shaders.py'), str(out), '--romfs', str(out / 'romfs'),
-           '--exefs', str(out / 'exefs'), '--no-list', '--exe', 'ocarina.exe']
+           '--exefs', str(out / 'exefs'), '--no-list', '--exe', EXE_NAME]
     if subprocess.run(cmd).returncode:
         fail('preparing the shaders failed (the lines above say why); the game still runs, compiling shaders as it '
              'meets them. Run the build again to retry this step')
@@ -1018,15 +1079,15 @@ def cpu_tag():
     """This processor's features the lifted code's level follows (cpu_level), as Windows reports them; part of the
     compile key, so a game folder moved to a PC without them (or a new processor) is compiled again rather than kept
     with instructions the processor lacks. 'any' where it cannot be read."""
-    if os.name != 'nt':
-        return 'any'
+    if not WIN:
+        return COMPILER_TAG
     try:
         import ctypes
         present = ctypes.windll.kernel32.IsProcessorFeaturePresent
         # PF_SSE4_2_INSTRUCTIONS_AVAILABLE 38, PF_AVX2_INSTRUCTIONS_AVAILABLE 40, PF_AVX512F_INSTRUCTIONS_AVAILABLE 41
-        return ''.join('1' if present(f) else '0' for f in (38, 40, 41))
+        return ''.join('1' if present(f) else '0' for f in (38, 40, 41)) + COMPILER_TAG
     except (OSError, AttributeError):
-        return 'any'
+        return 'any' + COMPILER_TAG
 
 
 def step_key(step, identity, out=None):
@@ -1042,7 +1103,10 @@ def step_key(step, identity, out=None):
     if step == 'compile':
         return compile_key
     # shaders: the built game and the translator that prepared them
-    return f'shaders-1|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}|{sha256_file(KIT / "bin" / "nx2navi_xlate.id")}'
+    translator = translator_bundle()
+    if not translator:
+        fail('shader translator missing: run python tools/build_xlate.py before preparing shaders')
+    return f'shaders-1|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}|{sha256_file(translator[1])}'
 
 
 def main():
@@ -1055,7 +1119,8 @@ def main():
                     help='build again from the game files the last run unpacked into --out (after a kit update)')
     ap.add_argument('--out', help='the folder for the finished game')
     ap.add_argument('--check', action='store_true', help='only check the game\'s version; builds nothing')
-    ap.add_argument('--msys', default=r'C:\msys64\ucrt64', help='MSYS2 UCRT64 folder (default C:\\msys64\\ucrt64)')
+    ap.add_argument('--msys', default=r'C:\msys64\ucrt64', help='Windows: MSYS2 UCRT64 folder')
+    ap.add_argument('--toolchain', type=Path, help='Linux: LLVM directory (bin/clang, bin/clang++); default PATH')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4, help='parallel compiles')
     ap.add_argument('--events', action='store_true', help='machine-readable progress lines on stdout ("@@" + JSON)')
     ap.add_argument('--make-runtime-lib', metavar='DIR', help='build the prebuilt runtime library of a release into DIR')
@@ -1063,8 +1128,9 @@ def main():
     ap.add_argument('--until', choices=STEPS, help=argparse.SUPPRESS)   # tests: stop after this step
     a = ap.parse_args()
     EVENTS = a.events
+    toolchain = Path(a.msys) if WIN else a.toolchain
     if a.make_runtime_lib:
-        make_runtime_lib(a.make_runtime_lib, Path(a.msys), a.jobs, a.obj)
+        make_runtime_lib(a.make_runtime_lib, toolchain, a.jobs, a.obj)
         return
     given = bool(a.nup) + bool(a.exefs or a.romfs) + bool(a.rebuild)
     if given != 1 or (not a.nup and not a.rebuild and not (a.exefs and a.romfs)):
@@ -1086,10 +1152,14 @@ def main():
         return
     if not out:
         ap.error('--out is needed to build')
-    msys = Path(a.msys)
-    for need in ('bin/clang.exe', 'bin/clang++.exe', 'bin/SDL3.dll', 'lib/libSDL3.dll.a', 'include/vma'):
-        if not (msys / need).exists():
-            fail(f'{msys / need} is missing: install MSYS2 and the packages README-BuildKit.md lists')
+    msys = toolchain
+    if WIN:
+        for need in ('bin/SDL3.dll', 'lib/libSDL3.dll.a', 'include/vma'):
+            if not (msys / need).exists():
+                fail(f'{msys / need} missing: install the MSYS2 packages in README-BuildKit.md')
+    clang, clangxx, env = compiler_tools(msys)
+    global COMPILER_TAG
+    COMPILER_TAG = f'{sys.platform}|{compiler_id(clang, env)}|cpu-v{cpu_level(clang, env)}'
     for mod in ('numpy', 'lz4') + (() if a.rebuild else ('zbic',)):
         try:
             __import__(mod)

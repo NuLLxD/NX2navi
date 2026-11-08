@@ -1,0 +1,44 @@
+name: Linux Ocarina build-kit checks
+
+on:
+  push:
+    branches: [port/linux-oot-111]
+  pull_request:
+    paths:
+      - tools/make_game.py
+      - tools/build_game.py
+      - tests/linux_make_game_test.py
+      - .github/workflows/linux-ocarina-build-kit.yml
+
+permissions:
+  contents: read
+
+jobs:
+  no-game-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check syntax
+        run: python -m py_compile tools/make_game.py tools/build_game.py tests/linux_make_game_test.py
+      - name: Check native build configuration
+        run: python -m unittest discover -s tests -p linux_make_game_test.py -v
+      - name: Check CLI
+        run: python tools/make_game.py --help
+      - name: Refuse game-derived or private files
+        run: python tools/check_content.py
+
+  arch-runtime-library:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install native Arch dependencies
+        run: |
+          pacman -Syu --noconfirm --needed ca-certificates git python clang lld llvm gcc make ninja \
+            sdl3 opus libvpx dav1d zstd vulkan-headers vulkan-icd-loader shaderc spirv-tools
+      - uses: actions/checkout@v4
+      - name: Compile the native runtime as an archive without game files
+        run: python tools/make_game.py --make-runtime-lib build/runtime-lib-linux --jobs 4

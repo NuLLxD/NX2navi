@@ -93,7 +93,8 @@ if WIN:
                  '-limm32', '-luuid', '-lole32', '-luser32', '-lshell32', '-lgdi32', '-ladvapi32', '-lwinmm']
 else:
     # Share the native link dependencies and VMA header fallback with the established Linux build.
-    from build_game import LINK_LIBS, vma_include  # noqa: E402
+    from build_game import LINK_LIBS as NATIVE_LINK_LIBS, vma_include  # noqa: E402
+    LINK_LIBS = [*NATIVE_LINK_LIBS, '-ldav1d']   # Ocarina 1.1.1 movie decoder
 SYSTEM_DLLS_SKIP = {'vulkan-1.dll'}   # the graphics driver's loader, never a copy
 EXE_NAME = 'ocarina.exe' if WIN else 'ocarina'
 XLATE_NAME = 'nx2navi_xlate.exe' if WIN else 'nx2navi_xlate'

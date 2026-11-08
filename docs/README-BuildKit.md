@@ -64,7 +64,7 @@ The build kit can now use the existing Linux SDL3/Vulkan runtime to build an ELF
 the same Ocarina of Time 1.1.1 `.nup` or extracted `exefs`/`romfs` inputs. This is an **experimental build path**;
 it has not yet been verified in gameplay. The Windows launcher and installer are not ported.
 
-On Arch Linux, install the toolchain listed under Linux in [building.md](building.md). `clang++` and a static
+On Arch Linux, install the toolchain listed under Linux in [building.md](building.md) plus `dav1d` for AV1 movies. `clang++` and a static
 `libstdc++.a` must also be available. The Vulkan Memory Allocator header is taken from the system when installed,
 otherwise the pinned version is fetched into `toolchain/vma`.
 
